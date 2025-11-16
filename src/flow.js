@@ -12,11 +12,11 @@ import axios from "axios";
 // CAL_API_KEY=cal_xxx
 // CAL_EVENT_TYPE_ID=3144943
 const CAL_API_KEY =
-  process.env.CAL_API_KEY || "cal_live_a97caae3eae6c385f755b9fdc38121ca";
+  process.env.CAL_API_KEY;
 const CAL_API_BASE_URL = "https://api.cal.com/v2";
 const CAL_SLOTS_API_VERSION = "2024-09-04";
 const CAL_BOOKING_API_VERSION = "2024-08-13"; // from your Python sample
-const CAL_EVENT_TYPE_ID = process.env.CAL_EVENT_TYPE_ID || "3144943";
+const CAL_EVENT_TYPE_ID = process.env.CAL_EVENT_TYPE_ID;
 const CAL_TIME_ZONE = "Asia/Kolkata"; // change if you want
 
 // ---------- SERVER-DRIVEN SCREENS ----------
