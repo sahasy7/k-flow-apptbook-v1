@@ -50,7 +50,6 @@ app.post("/", async (req, res) => {
     return res.status(432).send();
   }
 
-console.log(PRIVATE_KEY);
 
 
   let decryptedRequest = null;
