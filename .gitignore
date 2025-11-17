@@ -1,2 +1,4 @@
 node_modules/
 .env
+wa_encrypted_key.pem
+wa_private_key.pem
