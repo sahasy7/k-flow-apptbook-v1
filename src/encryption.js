@@ -1,95 +1,141 @@
 /**
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
- * This source code is licensed under the MIT license found in the
- * LICENSE file in the root directory of this source tree.
+ * Encryption / decryption helpers for WhatsApp Flows endpoint.
  */
 
 import crypto from "crypto";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
-export const decryptRequest = (body, privatePem, passphrase) => {
-  const { encrypted_aes_key, encrypted_flow_data, initial_vector } = body;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-  const privateKey = crypto.createPrivateKey({ key: privatePem, passphrase });
-  let decryptedAesKey = null;
-  try {
-    // decrypt AES key created by client
-    decryptedAesKey = crypto.privateDecrypt(
-      {
-        key: privateKey,
-        padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-        oaepHash: "sha256",
-      },
-      Buffer.from(encrypted_aes_key, "base64")
-    );
-  } catch (error) {
-    console.error(error);
-    /*
-    Failed to decrypt. Please verify your private key.
-    If you change your public key. You need to return HTTP status code 421 to refresh the public key on the client
-    */
-    throw new FlowEndpointException(
-      421,
-      "Failed to decrypt the request. Please verify your private key."
-    );
-  }
+// Default path where we created the key in the container
+const DEFAULT_KEY_PATH = path.join(__dirname, "wa_private_key.pem");
 
-  // decrypt flow data
-  const flowDataBuffer = Buffer.from(encrypted_flow_data, "base64");
-  const initialVectorBuffer = Buffer.from(initial_vector, "base64");
-
-  const TAG_LENGTH = 16;
-  const encrypted_flow_data_body = flowDataBuffer.subarray(0, -TAG_LENGTH);
-  const encrypted_flow_data_tag = flowDataBuffer.subarray(-TAG_LENGTH);
-
-  const decipher = crypto.createDecipheriv(
-    "aes-128-gcm",
-    decryptedAesKey,
-    initialVectorBuffer
-  );
-  decipher.setAuthTag(encrypted_flow_data_tag);
-
-  const decryptedJSONString = Buffer.concat([
-    decipher.update(encrypted_flow_data_body),
-    decipher.final(),
-  ]).toString("utf-8");
-
-  return {
-    decryptedBody: JSON.parse(decryptedJSONString),
-    aesKeyBuffer: decryptedAesKey,
-    initialVectorBuffer,
-  };
-};
-
-export const encryptResponse = (
-  response,
-  aesKeyBuffer,
-  initialVectorBuffer
-) => {
-  // flip initial vector
-  const flipped_iv = [];
-  for (const pair of initialVectorBuffer.entries()) {
-    flipped_iv.push(~pair[1]);
-  }
-
-  // encrypt response data
-  const cipher = crypto.createCipheriv(
-    "aes-128-gcm",
-    aesKeyBuffer,
-    Buffer.from(flipped_iv)
-  );
-  return Buffer.concat([
-    cipher.update(JSON.stringify(response), "utf-8"),
-    cipher.final(),
-    cipher.getAuthTag(),
-  ]).toString("base64");
-};
-
-export const FlowEndpointException = class FlowEndpointException extends Error {
-  constructor (statusCode, message) {
-    super(message)
-
-    this.name = this.constructor.name
+export class FlowEndpointException extends Error {
+  constructor(statusCode) {
+    super();
     this.statusCode = statusCode;
   }
+}
+
+/**
+ * Load the private key from file and create a Node crypto KeyObject.
+ */
+function loadPrivateKey() {
+  const keyPath = process.env.PRIVATE_KEY_PATH || DEFAULT_KEY_PATH;
+
+  let pem;
+  try {
+    pem = fs.readFileSync(keyPath, "utf8");
+  } catch (e) {
+    console.error("❌ Failed to read private key file:", keyPath, e);
+    throw new Error("Could not read private key file");
+  }
+
+  // Normalize newlines and trim
+  const rawKey = pem.replace(/\r/g, "").trim();
+  const lines = rawKey.split("\n");
+
+  console.log("🔐 PRIVATE_KEY from file:");
+  console.log("  Path:", keyPath);
+  console.log("  First line:", lines[0]);
+  console.log("  Last line:", lines[lines.length - 1]);
+
+  if (!rawKey.startsWith("-----BEGIN")) {
+    throw new Error("PRIVATE KEY file is not a valid PEM");
+  }
+
+  // Detect type: PKCS8 vs PKCS1
+  const keyType = rawKey.includes("BEGIN RSA PRIVATE KEY")
+    ? "pkcs1"
+    : "pkcs8";
+
+  try {
+    return crypto.createPrivateKey({
+      key: rawKey,
+      format: "pem",
+      type: keyType,
+      // key is unencrypted, so no passphrase
+    });
+  } catch (e) {
+    console.error("❌ createPrivateKey failed:", e);
+    throw e;
+  }
+}
+
+/**
+ * Decrypt incoming WhatsApp Flow request body.
+ * Returns { aesKeyBuffer, initialVectorBuffer, decryptedBody }.
+ */
+export function decryptRequest(body) {
+  const {
+    encrypted_body,
+    encrypted_key,
+    initial_vector,
+    authentication_tag,
+  } = body;
+
+  if (!encrypted_body || !encrypted_key || !initial_vector || !authentication_tag) {
+    console.error("❌ Malformed request body for decryption:", body);
+    throw new FlowEndpointException(400);
+  }
+
+  const privateKeyObject = loadPrivateKey();
+
+  // 1) Decrypt AES key using our RSA private key
+  const decryptedAesKey = crypto.privateDecrypt(
+    {
+      key: privateKeyObject,
+      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+      oaepHash: "sha256",
+    },
+    Buffer.from(encrypted_key, "base64")
+  );
+
+  // 2) Decrypt payload with AES-256-GCM
+  const decipher = crypto.createDecipheriv(
+    "aes-256-gcm",
+    decryptedAesKey,
+    Buffer.from(initial_vector, "base64")
+  );
+  decipher.setAuthTag(Buffer.from(authentication_tag, "base64"));
+
+  let decrypted = decipher.update(encrypted_body, "base64", "utf8");
+  decrypted += decipher.final("utf8");
+
+  const decryptedBody = JSON.parse(decrypted);
+
+  return {
+    aesKeyBuffer: decryptedAesKey,
+    initialVectorBuffer: Buffer.from(initial_vector, "base64"),
+    decryptedBody,
+  };
+}
+
+/**
+ * Encrypt response JSON back to WhatsApp.
+ */
+export function encryptResponse(responseBody, aesKeyBuffer, initialVectorBuffer) {
+  const cipher = crypto.createCipheriv(
+    "aes-256-gcm",
+    aesKeyBuffer,
+    initialVectorBuffer
+  );
+
+  const json = JSON.stringify(responseBody);
+
+  let encrypted = cipher.update(json, "utf8", "base64");
+  encrypted += cipher.final("base64");
+
+  const authTag = cipher.getAuthTag().toString("base64");
+
+  return {
+    encrypted_body: encrypted,
+    initial_vector: initialVectorBuffer.toString("base64"),
+    authentication_tag: authTag,
+  };
 }
