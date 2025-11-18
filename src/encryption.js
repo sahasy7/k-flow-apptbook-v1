@@ -1,6 +1,4 @@
 /**
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- *
  * Encryption / decryption helpers for WhatsApp Flows endpoint.
  */
 
@@ -12,7 +10,7 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Default path where we created the key in the container
+// Default path to your private key file
 const DEFAULT_KEY_PATH = path.join(__dirname, "wa_private_key.pem");
 
 export class FlowEndpointException extends Error {
@@ -36,7 +34,6 @@ function loadPrivateKey() {
     throw new Error("Could not read private key file");
   }
 
-  // Normalize newlines and trim
   const rawKey = pem.replace(/\r/g, "").trim();
   const lines = rawKey.split("\n");
 
@@ -49,7 +46,6 @@ function loadPrivateKey() {
     throw new Error("PRIVATE KEY file is not a valid PEM");
   }
 
-  // Detect type: PKCS8 vs PKCS1
   const keyType = rawKey.includes("BEGIN RSA PRIVATE KEY")
     ? "pkcs1"
     : "pkcs8";
@@ -59,7 +55,6 @@ function loadPrivateKey() {
       key: rawKey,
       format: "pem",
       type: keyType,
-      // key is unencrypted, so no passphrase
     });
   } catch (e) {
     console.error("❌ createPrivateKey failed:", e);
@@ -69,17 +64,19 @@ function loadPrivateKey() {
 
 /**
  * Decrypt incoming WhatsApp Flow request body.
- * Returns { aesKeyBuffer, initialVectorBuffer, decryptedBody }.
+ * WhatsApp sends:
+ *  - encrypted_flow_data (AES-256-CBC ciphertext, base64)
+ *  - encrypted_aes_key   (RSA-encrypted AES key, base64)
+ *  - initial_vector      (IV for AES, base64)
  */
 export function decryptRequest(body) {
   const {
-    encrypted_body,
-    encrypted_key,
+    encrypted_flow_data,
+    encrypted_aes_key,
     initial_vector,
-    authentication_tag,
   } = body;
 
-  if (!encrypted_body || !encrypted_key || !initial_vector || !authentication_tag) {
+  if (!encrypted_flow_data || !encrypted_aes_key || !initial_vector) {
     console.error("❌ Malformed request body for decryption:", body);
     throw new FlowEndpointException(400);
   }
@@ -91,37 +88,36 @@ export function decryptRequest(body) {
     {
       key: privateKeyObject,
       padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-      oaepHash: "sha256",
+      // oaepHash default (SHA1) matches Meta sample
     },
-    Buffer.from(encrypted_key, "base64")
+    Buffer.from(encrypted_aes_key, "base64")
   );
 
-  // 2) Decrypt payload with AES-256-GCM
-  const decipher = crypto.createDecipheriv(
-    "aes-256-gcm",
-    decryptedAesKey,
-    Buffer.from(initial_vector, "base64")
-  );
-  decipher.setAuthTag(Buffer.from(authentication_tag, "base64"));
+  // 2) Decrypt payload with AES-256-CBC
+  const ivBuffer = Buffer.from(initial_vector, "base64");
+  const decipher = crypto.createDecipheriv("aes-256-cbc", decryptedAesKey, ivBuffer);
 
-  let decrypted = decipher.update(encrypted_body, "base64", "utf8");
+  let decrypted = decipher.update(encrypted_flow_data, "base64", "utf8");
   decrypted += decipher.final("utf8");
 
   const decryptedBody = JSON.parse(decrypted);
 
   return {
     aesKeyBuffer: decryptedAesKey,
-    initialVectorBuffer: Buffer.from(initial_vector, "base64"),
+    initialVectorBuffer: ivBuffer,
     decryptedBody,
   };
 }
 
 /**
  * Encrypt response JSON back to WhatsApp.
+ * Response must contain:
+ *  - encrypted_flow_data (AES-256-CBC ciphertext, base64)
+ * WhatsApp already knows the AES key & IV, so we just reuse them.
  */
 export function encryptResponse(responseBody, aesKeyBuffer, initialVectorBuffer) {
   const cipher = crypto.createCipheriv(
-    "aes-256-gcm",
+    "aes-256-cbc",
     aesKeyBuffer,
     initialVectorBuffer
   );
@@ -131,11 +127,7 @@ export function encryptResponse(responseBody, aesKeyBuffer, initialVectorBuffer)
   let encrypted = cipher.update(json, "utf8", "base64");
   encrypted += cipher.final("base64");
 
-  const authTag = cipher.getAuthTag().toString("base64");
-
   return {
-    encrypted_body: encrypted,
-    initial_vector: initialVectorBuffer.toString("base64"),
-    authentication_tag: authTag,
+    encrypted_flow_data: encrypted,
   };
 }
