@@ -1,3 +1,4 @@
+
 /**
  * Encryption / decryption helpers for WhatsApp Flows endpoint.
  */
@@ -63,6 +64,48 @@ function loadPrivateKey() {
 }
 
 /**
+ * Try to decrypt the AES key using RSA OAEP.
+ * First try SHA-256 (common in newer docs),
+ * if that fails with OAEP error, fall back to default OAEP (SHA-1).
+ */
+function rsaDecryptAesKey(privateKeyObject, encryptedAesKeyBase64) {
+  const encryptedBuf = Buffer.from(encryptedAesKeyBase64, "base64");
+
+  // Try OAEP + SHA-256 first
+  try {
+    return crypto.privateDecrypt(
+      {
+        key: privateKeyObject,
+        padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+        oaepHash: "sha256",
+      },
+      encryptedBuf
+    );
+  } catch (err) {
+    if (err.code !== "ERR_OSSL_RSA_OAEP_DECODING_ERROR") {
+      console.error("❌ RSA decrypt (SHA-256) failed with non-OAEP error:", err);
+      throw err;
+    }
+    console.warn("⚠️ RSA decrypt with SHA-256 failed, trying default OAEP (SHA-1)...");
+  }
+
+  // Fallback: OAEP with default hash (SHA-1)
+  try {
+    return crypto.privateDecrypt(
+      {
+        key: privateKeyObject,
+        padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+        // no oaepHash -> default
+      },
+      encryptedBuf
+    );
+  } catch (err2) {
+    console.error("❌ RSA decrypt failed with both SHA-256 and default OAEP:", err2);
+    throw err2;
+  }
+}
+
+/**
  * Decrypt incoming WhatsApp Flow request body.
  * WhatsApp sends:
  *  - encrypted_flow_data (AES-256-CBC ciphertext, base64)
@@ -83,19 +126,19 @@ export function decryptRequest(body) {
 
   const privateKeyObject = loadPrivateKey();
 
-  // 1) Decrypt AES key using our RSA private key
-  const decryptedAesKey = crypto.privateDecrypt(
-    {
-      key: privateKeyObject,
-      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-      // oaepHash default (SHA1) matches Meta sample
-    },
-    Buffer.from(encrypted_aes_key, "base64")
+  // 1) Decrypt AES key using our RSA private key (with dual OAEP strategy)
+  const decryptedAesKey = rsaDecryptAesKey(
+    privateKeyObject,
+    encrypted_aes_key
   );
 
   // 2) Decrypt payload with AES-256-CBC
   const ivBuffer = Buffer.from(initial_vector, "base64");
-  const decipher = crypto.createDecipheriv("aes-256-cbc", decryptedAesKey, ivBuffer);
+  const decipher = crypto.createDecipheriv(
+    "aes-256-cbc",
+    decryptedAesKey,
+    ivBuffer
+  );
 
   let decrypted = decipher.update(encrypted_flow_data, "base64", "utf8");
   decrypted += decipher.final("utf8");
