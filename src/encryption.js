@@ -1,4 +1,3 @@
-
 /**
  * Encryption / decryption helpers for WhatsApp Flows endpoint.
  */
@@ -64,9 +63,19 @@ function loadPrivateKey() {
 }
 
 /**
+ * Decide which AES-CBC algorithm to use based on key length.
+ */
+function getAesCbcAlgorithm(aesKeyBuffer) {
+  const len = aesKeyBuffer.length; // bytes
+  if (len === 16) return "aes-128-cbc";
+  if (len === 24) return "aes-192-cbc";
+  if (len === 32) return "aes-256-cbc";
+  throw new Error(`Unsupported AES key length: ${len} bytes`);
+}
+
+/**
  * Try to decrypt the AES key using RSA OAEP.
- * First try SHA-256 (common in newer docs),
- * if that fails with OAEP error, fall back to default OAEP (SHA-1).
+ * First try SHA-256, then fallback to default OAEP (SHA-1).
  */
 function rsaDecryptAesKey(privateKeyObject, encryptedAesKeyBase64) {
   const encryptedBuf = Buffer.from(encryptedAesKeyBase64, "base64");
@@ -95,7 +104,6 @@ function rsaDecryptAesKey(privateKeyObject, encryptedAesKeyBase64) {
       {
         key: privateKeyObject,
         padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
-        // no oaepHash -> default
       },
       encryptedBuf
     );
@@ -108,7 +116,7 @@ function rsaDecryptAesKey(privateKeyObject, encryptedAesKeyBase64) {
 /**
  * Decrypt incoming WhatsApp Flow request body.
  * WhatsApp sends:
- *  - encrypted_flow_data (AES-256-CBC ciphertext, base64)
+ *  - encrypted_flow_data (AES-encrypted payload, base64)
  *  - encrypted_aes_key   (RSA-encrypted AES key, base64)
  *  - initial_vector      (IV for AES, base64)
  */
@@ -132,13 +140,14 @@ export function decryptRequest(body) {
     encrypted_aes_key
   );
 
-  // 2) Decrypt payload with AES-256-CBC
+  console.log("🔑 Decrypted AES key length (bytes):", decryptedAesKey.length);
+
+  // 2) Choose AES algorithm based on key length
+  const algo = getAesCbcAlgorithm(decryptedAesKey);
+
+  // 3) Decrypt payload with AES-CBC
   const ivBuffer = Buffer.from(initial_vector, "base64");
-  const decipher = crypto.createDecipheriv(
-    "aes-256-cbc",
-    decryptedAesKey,
-    ivBuffer
-  );
+  const decipher = crypto.createDecipheriv(algo, decryptedAesKey, ivBuffer);
 
   let decrypted = decipher.update(encrypted_flow_data, "base64", "utf8");
   decrypted += decipher.final("utf8");
@@ -155,12 +164,14 @@ export function decryptRequest(body) {
 /**
  * Encrypt response JSON back to WhatsApp.
  * Response must contain:
- *  - encrypted_flow_data (AES-256-CBC ciphertext, base64)
+ *  - encrypted_flow_data (AES-CBC ciphertext, base64)
  * WhatsApp already knows the AES key & IV, so we just reuse them.
  */
 export function encryptResponse(responseBody, aesKeyBuffer, initialVectorBuffer) {
+  const algo = getAesCbcAlgorithm(aesKeyBuffer);
+
   const cipher = crypto.createCipheriv(
-    "aes-256-cbc",
+    algo,
     aesKeyBuffer,
     initialVectorBuffer
   );
