@@ -1,5 +1,6 @@
 /**
  * Encryption / decryption helpers for WhatsApp Flows endpoint.
+ * Fixed for Node.js 20+ compatibility
  */
 
 import crypto from "crypto";
@@ -22,9 +23,11 @@ export class FlowEndpointException extends Error {
 
 /**
  * Load the private key from file and create a Node crypto KeyObject.
+ * Supports both encrypted PKCS#1 and unencrypted PKCS#8 formats.
  */
 function loadPrivateKey() {
   const keyPath = process.env.PRIVATE_KEY_PATH || DEFAULT_KEY_PATH;
+  const passphrase = process.env.PRIVATE_KEY_PASSPHRASE; // Add passphrase support
 
   let pem;
   try {
@@ -46,16 +49,34 @@ function loadPrivateKey() {
     throw new Error("PRIVATE KEY file is not a valid PEM");
   }
 
+  // Detect key type and encryption
+  const isEncrypted = rawKey.includes("Proc-Type: 4,ENCRYPTED");
   const keyType = rawKey.includes("BEGIN RSA PRIVATE KEY")
     ? "pkcs1"
     : "pkcs8";
 
+  console.log("  Key type:", keyType);
+  console.log("  Encrypted:", isEncrypted);
+
   try {
-    return crypto.createPrivateKey({
+    const keyOptions = {
       key: rawKey,
       format: "pem",
       type: keyType,
-    });
+    };
+
+    // Add passphrase if key is encrypted
+    if (isEncrypted) {
+      if (!passphrase) {
+        throw new Error(
+          "Private key is encrypted but PRIVATE_KEY_PASSPHRASE environment variable is not set"
+        );
+      }
+      keyOptions.passphrase = passphrase;
+      console.log("  Using passphrase for encrypted key");
+    }
+
+    return crypto.createPrivateKey(keyOptions);
   } catch (e) {
     console.error("❌ createPrivateKey failed:", e);
     throw e;
@@ -121,44 +142,152 @@ function rsaDecryptAesKey(privateKeyObject, encryptedAesKeyBase64) {
  *  - initial_vector      (IV for AES, base64)
  */
 export function decryptRequest(body) {
+  console.log("🔍 === DECRYPTION REQUEST STARTED ===");
+  
   const {
     encrypted_flow_data,
     encrypted_aes_key,
     initial_vector,
   } = body;
 
+  // Log incoming data (first 50 chars only for security)
+  console.log("📥 Incoming data:");
+  console.log("  encrypted_flow_data:", encrypted_flow_data?.substring(0, 50) + "...");
+  console.log("  encrypted_aes_key:", encrypted_aes_key?.substring(0, 50) + "...");
+  console.log("  initial_vector:", initial_vector?.substring(0, 50) + "...");
+
   if (!encrypted_flow_data || !encrypted_aes_key || !initial_vector) {
-    console.error("❌ Malformed request body for decryption:", body);
+    console.error("❌ Malformed request body for decryption");
     throw new FlowEndpointException(400);
   }
 
-  const privateKeyObject = loadPrivateKey();
+  try {
+    // Step 1: Load private key
+    console.log("📋 Step 1: Loading private key...");
+    const privateKeyObject = loadPrivateKey();
+    console.log("✅ Private key loaded successfully");
 
-  // 1) Decrypt AES key using our RSA private key (with dual OAEP strategy)
-  const decryptedAesKey = rsaDecryptAesKey(
-    privateKeyObject,
-    encrypted_aes_key
-  );
+    // Step 2: Decrypt AES key using RSA
+    console.log("📋 Step 2: Decrypting AES key with RSA...");
+    let decryptedAesKey;
+    try {
+      decryptedAesKey = rsaDecryptAesKey(privateKeyObject, encrypted_aes_key);
+      console.log("✅ RSA decryption successful");
+      console.log("🔑 Decrypted AES key length:", decryptedAesKey.length, "bytes");
+      console.log("🔑 AES key (hex):", decryptedAesKey.toString('hex').substring(0, 32) + "...");
+    } catch (rsaError) {
+      console.error("❌ RSA decryption FAILED:", rsaError.message);
+      console.error("This means the private key doesn't match the public key used by WhatsApp");
+      throw rsaError;
+    }
 
-  console.log("🔑 Decrypted AES key length (bytes):", decryptedAesKey.length);
+    // Step 3: Determine AES algorithm
+    console.log("📋 Step 3: Determining AES algorithm...");
+    const algo = getAesCbcAlgorithm(decryptedAesKey);
+    console.log("✅ Using algorithm:", algo);
 
-  // 2) Choose AES algorithm based on key length
-  const algo = getAesCbcAlgorithm(decryptedAesKey);
+    // Step 4: Prepare buffers
+    console.log("📋 Step 4: Preparing decryption buffers...");
+    const ivBuffer = Buffer.from(initial_vector, "base64");
+    const encryptedDataBuffer = Buffer.from(encrypted_flow_data, "base64");
 
-  // 3) Decrypt payload with AES-CBC
-  const ivBuffer = Buffer.from(initial_vector, "base64");
-  const decipher = crypto.createDecipheriv(algo, decryptedAesKey, ivBuffer);
+    console.log("📊 Buffer information:");
+    console.log("  IV length:", ivBuffer.length, "bytes (expected: 16)");
+    console.log("  IV (hex):", ivBuffer.toString('hex'));
+    console.log("  Encrypted data length:", encryptedDataBuffer.length, "bytes");
+    console.log("  AES key length:", decryptedAesKey.length, "bytes");
+    console.log("  Data is multiple of 16?", encryptedDataBuffer.length % 16 === 0);
 
-  let decrypted = decipher.update(encrypted_flow_data, "base64", "utf8");
-  decrypted += decipher.final("utf8");
+    // Validate IV length
+    if (ivBuffer.length !== 16) {
+      throw new Error(`Invalid IV length: ${ivBuffer.length}, expected 16 bytes`);
+    }
 
-  const decryptedBody = JSON.parse(decrypted);
+    // Validate encrypted data is multiple of block size
+    if (encryptedDataBuffer.length % 16 !== 0) {
+      console.error("⚠️ WARNING: Encrypted data length is NOT a multiple of 16!");
+      console.error("  Length:", encryptedDataBuffer.length);
+      console.error("  Remainder:", encryptedDataBuffer.length % 16);
+      console.error("This will cause 'wrong final block length' error!");
+      throw new Error("Encrypted data has invalid length - not a multiple of block size");
+    }
 
-  return {
-    aesKeyBuffer: decryptedAesKey,
-    initialVectorBuffer: ivBuffer,
-    decryptedBody,
-  };
+    // Step 5: Perform AES-CBC decryption
+    console.log("📋 Step 5: Performing AES-CBC decryption...");
+    const decipher = crypto.createDecipheriv(algo, decryptedAesKey, ivBuffer);
+    decipher.setAutoPadding(true);
+
+    let decrypted;
+    try {
+      console.log("  Calling decipher.update()...");
+      const part1 = decipher.update(encryptedDataBuffer);
+      console.log("  ✅ decipher.update() successful, got", part1.length, "bytes");
+      
+      console.log("  Calling decipher.final()...");
+      const part2 = decipher.final();
+      console.log("  ✅ decipher.final() successful, got", part2.length, "bytes");
+      
+      const decryptedBuffer = Buffer.concat([part1, part2]);
+      decrypted = decryptedBuffer.toString("utf8");
+      console.log("✅ AES decryption successful, decrypted", decrypted.length, "chars");
+    } catch (finalError) {
+      console.error("❌ AES decipher.final() FAILED:", finalError.message);
+      console.error("Error code:", finalError.code);
+      console.error("");
+      console.error("🔍 DEBUGGING INFO:");
+      console.error("  1. Check if encrypted_flow_data is complete and not truncated");
+      console.error("  2. Verify initial_vector is correct");
+      console.error("  3. Confirm WhatsApp is using the correct public key");
+      console.error("");
+      
+      // Try manual padding removal
+      console.log("🔄 Attempting manual padding removal...");
+      const decipher2 = crypto.createDecipheriv(algo, decryptedAesKey, ivBuffer);
+      decipher2.setAutoPadding(false);
+      
+      try {
+        const decryptedBuffer2 = Buffer.concat([
+          decipher2.update(encryptedDataBuffer),
+          decipher2.final()
+        ]);
+        
+        console.log("  Decrypted buffer length:", decryptedBuffer2.length);
+        console.log("  Last 5 bytes:", decryptedBuffer2.slice(-5).toString('hex'));
+        
+        // Manually remove PKCS7 padding
+        const paddingLength = decryptedBuffer2[decryptedBuffer2.length - 1];
+        console.log("  Detected padding length:", paddingLength);
+        
+        if (paddingLength > 0 && paddingLength <= 16) {
+          const unpaddedBuffer = decryptedBuffer2.slice(0, -paddingLength);
+          decrypted = unpaddedBuffer.toString("utf8");
+          console.log("✅ Manual padding removal succeeded!");
+        } else {
+          throw new Error("Invalid padding length: " + paddingLength);
+        }
+      } catch (noPaddingError) {
+        console.error("❌ Manual padding removal also failed:", noPaddingError.message);
+        throw finalError;
+      }
+    }
+
+    // Step 6: Parse JSON
+    console.log("📋 Step 6: Parsing JSON...");
+    const decryptedBody = JSON.parse(decrypted);
+    console.log("✅ JSON parsed successfully");
+    console.log("🔍 === DECRYPTION COMPLETED SUCCESSFULLY ===");
+
+    return {
+      aesKeyBuffer: decryptedAesKey,
+      initialVectorBuffer: ivBuffer,
+      decryptedBody,
+    };
+  } catch (error) {
+    console.error("❌ === DECRYPTION FAILED ===");
+    console.error("Error:", error.message);
+    console.error("Stack:", error.stack);
+    throw error;
+  }
 }
 
 /**
@@ -168,20 +297,34 @@ export function decryptRequest(body) {
  * WhatsApp already knows the AES key & IV, so we just reuse them.
  */
 export function encryptResponse(responseBody, aesKeyBuffer, initialVectorBuffer) {
-  const algo = getAesCbcAlgorithm(aesKeyBuffer);
+  try {
+    const algo = getAesCbcAlgorithm(aesKeyBuffer);
 
-  const cipher = crypto.createCipheriv(
-    algo,
-    aesKeyBuffer,
-    initialVectorBuffer
-  );
+    const cipher = crypto.createCipheriv(
+      algo,
+      aesKeyBuffer,
+      initialVectorBuffer
+    );
 
-  const json = JSON.stringify(responseBody);
+    const json = JSON.stringify(responseBody);
 
-  let encrypted = cipher.update(json, "utf8", "base64");
-  encrypted += cipher.final("base64");
+    // Use Buffer approach for consistency with decryption
+    const encryptedBuffer = Buffer.concat([
+      cipher.update(json, "utf8"),
+      cipher.final()
+    ]);
 
-  return {
-    encrypted_flow_data: encrypted,
-  };
+    const encrypted = encryptedBuffer.toString("base64");
+
+    console.log("✅ Encryption successful");
+    console.log("  Response length:", json.length, "bytes");
+    console.log("  Encrypted length:", encrypted.length, "bytes");
+
+    return {
+      encrypted_flow_data: encrypted,
+    };
+  } catch (error) {
+    console.error("❌ Error during encryptResponse:", error);
+    throw error;
+  }
 }
