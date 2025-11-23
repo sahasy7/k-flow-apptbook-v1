@@ -26,48 +26,81 @@ function loadPrivateKey() {
   console.log("🔍 Loading private key...");
   console.log("  Expected path:", keyPath);
   console.log("  File exists:", fs.existsSync(keyPath));
-  console.log("  Current directory:", process.cwd());
-  console.log("  __dirname:", __dirname);
+  console.log("  Passphrase provided:", passphrase ? "Yes (length: " + passphrase.length + ")" : "No ❌");
 
   let pem;
   try {
     pem = fs.readFileSync(keyPath, "utf8");
   } catch (e) {
     console.error("❌ Failed to read private key file:", keyPath, e);
-    console.error("  Error code:", e.code);
-    console.error("  Error message:", e.message);
-    
-    // Try to list files in the directory
-    try {
-      const dir = path.dirname(keyPath);
-      const files = fs.readdirSync(dir);
-      console.error("  Files in", dir, ":", files);
-    } catch (listErr) {
-      console.error("  Could not list directory:", listErr.message);
-    }
-    
-    throw new FlowEndpointException(
-      500,
-      "Could not read private key file"
-    );
+    throw new FlowEndpointException(500, "Could not read private key file");
   }
 
   console.log("📄 Key file loaded:");
   console.log("  Total length:", pem.length, "characters");
-  console.log("  First line:", pem.split('\n')[0]);
+  const lines = pem.split('\n');
+  console.log("  First line:", lines[0]);
+  console.log("  Second line:", lines[1]);
+  console.log("  Third line:", lines[2]?.substring(0, 50) + "...");
 
   const rawKey = pem.replace(/\r/g, "").trim();
+  
+  // Check if key is encrypted (look for Proc-Type header)
+  const isEncrypted = rawKey.includes("Proc-Type: 4,ENCRYPTED") || rawKey.includes("BEGIN ENCRYPTED");
+  console.log("  Is encrypted:", isEncrypted);
 
-  try {
-    return crypto.createPrivateKey({ 
-      key: rawKey, 
-      passphrase: passphrase || undefined 
-    });
-  } catch (e) {
-    console.error("❌ createPrivateKey failed:", e);
+  if (isEncrypted && !passphrase) {
     throw new FlowEndpointException(
       500,
-      "Failed to create private key object: " + e.message
+      "Private key is encrypted but PRIVATE_KEY_PASSPHRASE is not set or empty"
+    );
+  }
+
+  try {
+    const keyOptions = {
+      key: rawKey,
+      format: "pem",
+    };
+    
+    // Detect key type
+    if (rawKey.includes("BEGIN RSA PRIVATE KEY")) {
+      keyOptions.type = "pkcs1";
+    } else if (rawKey.includes("BEGIN PRIVATE KEY")) {
+      keyOptions.type = "pkcs8";
+    }
+    
+    // Add passphrase if provided and key is encrypted
+    if (passphrase) {
+      keyOptions.passphrase = passphrase;
+      console.log("  Using passphrase for decryption");
+    }
+
+    console.log("  Key type:", keyOptions.type);
+    const privateKey = crypto.createPrivateKey(keyOptions);
+    console.log("✅ Private key loaded successfully");
+    return privateKey;
+    
+  } catch (e) {
+    console.error("❌ createPrivateKey failed:", e.message);
+    console.error("   Error code:", e.code);
+    
+    if (e.message.includes("bad password") || e.code?.includes("BAD_PASSWORD")) {
+      throw new FlowEndpointException(
+        500,
+        "Incorrect passphrase for encrypted private key"
+      );
+    }
+    
+    if (e.code === "ERR_OSSL_CRYPTO_INTERRUPTED_OR_CANCELLED") {
+      throw new FlowEndpointException(
+        500,
+        "Key decryption was cancelled. This usually means wrong passphrase or corrupted key file."
+      );
+    }
+    
+    throw new FlowEndpointException(
+      500,
+      "Failed to load private key: " + e.message
     );
   }
 }
