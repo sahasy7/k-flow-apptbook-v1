@@ -29,23 +29,16 @@ app.use(
   }),
 );
 
-const { APP_SECRET, PRIVATE_KEY, PASSPHRASE = "", PORT = "3000" } = process.env;
+// CHANGED: Only removed PRIVATE_KEY - PASSPHRASE still comes from env
+const { APP_SECRET, PASSPHRASE = "", PORT = "3000" } = process.env;
 
 /*
-Example:
-```-----[REPLACE THIS] BEGIN RSA PRIVATE KEY-----
-MIIE...
-...
-...AQAB
------[REPLACE THIS] END RSA PRIVATE KEY-----```
+Note: Private key is now loaded from wa_private_key.pem file
+PASSPHRASE (if needed) is still loaded from environment variable
 */
 
 app.post("/", async (req, res) => {
-  if (!PRIVATE_KEY) {
-    throw new Error(
-      'Private key is empty. Please check your env variable "PRIVATE_KEY".'
-    );
-  }
+  // REMOVED: Private key check - encryption.js will handle loading from file
 
   if(!isRequestSignatureValid(req)) {
     // Return status code 432 if request signature does not match.
@@ -55,7 +48,10 @@ app.post("/", async (req, res) => {
 
   let decryptedRequest = null;
   try {
-    decryptedRequest = decryptRequest(req.body, PRIVATE_KEY, PASSPHRASE);
+    // CHANGED: Only passing req.body
+    // Private key will be loaded from wa_private_key.pem file
+    // PASSPHRASE is handled via environment variable in encryption.js
+    decryptedRequest = decryptRequest(req.body);
   } catch (err) {
     console.error(err);
     if (err instanceof FlowEndpointException) {
@@ -97,6 +93,8 @@ Checkout README.md to start.</pre>`);
 
 app.listen(PORT, () => {
   console.log(`Server is listening on port: ${PORT}`);
+  console.log(`🔑 Private key will be loaded from: src/wa_private_key.pem file`);
+  console.log(`🔐 PASSPHRASE: ${PASSPHRASE ? 'Set ✅' : 'Not set (unencrypted key) ⚠️'}`);
 });
 
 function isRequestSignatureValid(req) {
@@ -106,11 +104,11 @@ function isRequestSignatureValid(req) {
   }
 
   const signatureHeader = req.get("x-hub-signature-256");
-  const signatureBuffer = Buffer.from(signatureHeader.replace("sha256=", ""), "utf-8");
+  const signatureBuffer = Buffer.from(signatureHeader.replace("sha256=", ""), "hex");
 
   const hmac = crypto.createHmac("sha256", APP_SECRET);
   const digestString = hmac.update(req.rawBody).digest('hex');
-  const digestBuffer = Buffer.from(digestString, "utf-8");
+  const digestBuffer = Buffer.from(digestString, "hex");
 
   if ( !crypto.timingSafeEqual(digestBuffer, signatureBuffer)) {
     console.error("Error: Request Signature did not match");
