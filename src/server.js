@@ -1,16 +1,15 @@
 /**
  * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 import express from "express";
-import {
-  decryptRequest,
-  encryptResponse,
-  FlowEndpointException,
-} from "./encryption.js";
+import { decryptRequest, encryptResponse, FlowEndpointException } from "./encryption.js";
 import { getNextScreen } from "./flow.js";
 import crypto from "crypto";
-import dotenv from "dotenv";
+import dotenv from 'dotenv';
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -21,86 +20,44 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 
 const app = express();
 
-// CRITICAL: Use strict JSON parsing with increased limit
 app.use(
   express.json({
-    limit: '50mb',
-    strict: true,
-    type: 'application/json',
-    // store raw body for HMAC verification
+    // store the raw request body to use it for signature verification
     verify: (req, res, buf, encoding) => {
       req.rawBody = buf?.toString(encoding || "utf8");
     },
-  })
+  }),
 );
 
-const { APP_SECRET, PORT = "3000" } = process.env;
+const { APP_SECRET, PRIVATE_KEY, PASSPHRASE = "", PORT = "3000" } = process.env;
+
+/*
+Example:
+```-----[REPLACE THIS] BEGIN RSA PRIVATE KEY-----
+MIIE...
+...
+...AQAB
+-----[REPLACE THIS] END RSA PRIVATE KEY-----```
+*/
 
 app.post("/", async (req, res) => {
-  console.log("📨 === INCOMING WEBHOOK REQUEST ===");
-  console.log("Content-Type:", req.get("content-type"));
-  console.log("Content-Length:", req.get("content-length"));
-  console.log("User-Agent:", req.get("user-agent"));
-  
-  // Diagnostic: Log the incoming body structure
-  console.log("\n📦 Request body structure:");
-  console.log("  Keys:", Object.keys(req.body));
-  
-  if (req.body.encrypted_flow_data) {
-    const flowData = req.body.encrypted_flow_data;
-    console.log("\n📏 encrypted_flow_data:");
-    console.log("  Type:", typeof flowData);
-    console.log("  Length:", flowData.length, "characters");
-    console.log("  First 30 chars:", flowData.substring(0, 30));
-    console.log("  Last 30 chars:", flowData.substring(flowData.length - 30));
-    
-    // Check for invalid characters in base64
-    const base64Regex = /^[A-Za-z0-9+/]*={0,2}$/;
-    const isValidBase64Format = base64Regex.test(flowData);
-    console.log("  Valid base64 format:", isValidBase64Format);
-    
-    if (!isValidBase64Format) {
-      console.error("  ❌ Contains invalid base64 characters!");
-      const invalidChars = flowData.match(/[^A-Za-z0-9+/=]/g);
-      console.error("  Invalid characters found:", invalidChars);
-    }
-    
-    // Try to decode to check length
-    try {
-      const decoded = Buffer.from(flowData, 'base64');
-      console.log("  Decoded length:", decoded.length, "bytes");
-      console.log("  Is multiple of 16:", decoded.length % 16 === 0);
-    } catch (e) {
-      console.error("  ❌ Failed to decode base64:", e.message);
-    }
+  if (!PRIVATE_KEY) {
+    throw new Error(
+      'Private key is empty. Please check your env variable "PRIVATE_KEY".'
+    );
   }
-  
-  if (req.body.encrypted_aes_key) {
-    console.log("\n📏 encrypted_aes_key:");
-    console.log("  Length:", req.body.encrypted_aes_key.length, "characters");
-  }
-  
-  if (req.body.initial_vector) {
-    console.log("\n📏 initial_vector:");
-    console.log("  Length:", req.body.initial_vector.length, "characters");
-  }
-  
-  // 🔐 Signature validation (Meta HMAC)
-  console.log("\n🔐 Validating HMAC signature...");
-  if (!isRequestSignatureValid(req)) {
-    console.error("❌ Invalid x-hub-signature-256");
-    // 432 = endpoint signature validation failed (per docs)
+
+  if(!isRequestSignatureValid(req)) {
+    // Return status code 432 if request signature does not match.
+    // To learn more about return error codes visit: https://developers.facebook.com/docs/whatsapp/flows/reference/error-codes#endpoint_error_codes
     return res.status(432).send();
   }
-  console.log("✅ HMAC signature valid");
 
-  let decryptedRequest;
+  let decryptedRequest = null;
   try {
-    console.log("\n🔓 Starting decryption...");
-    decryptedRequest = decryptRequest(req.body);
+    decryptedRequest = decryptRequest(req.body, PRIVATE_KEY, PASSPHRASE);
   } catch (err) {
-    console.error("\n❌ Error during decryptRequest:", err);
-    console.error("Stack:", err.stack);
+    console.error(err);
     if (err instanceof FlowEndpointException) {
       return res.status(err.statusCode).send();
     }
@@ -108,74 +65,56 @@ app.post("/", async (req, res) => {
   }
 
   const { aesKeyBuffer, initialVectorBuffer, decryptedBody } = decryptedRequest;
-  console.log("💬 Decrypted Request:", JSON.stringify(decryptedBody, null, 2));
+  console.log("💬 Decrypted Request:", decryptedBody);
 
-  // OPTIONAL: here you could validate flow_token if you want
-  // if (!isValidFlowToken(decryptedBody.flow_token)) { ... }
+  // TODO: Uncomment this block and add your flow token validation logic.
+  // If the flow token becomes invalid, return HTTP code 427 to disable the flow and show the message in `error_msg` to the user
+  // Refer to the docs for details https://developers.facebook.com/docs/whatsapp/flows/reference/error-codes#endpoint_error_codes
 
-  let screenResponse;
-  try {
-    screenResponse = await getNextScreen(decryptedBody);
-  } catch (err) {
-    console.error("❌ Error in getNextScreen:", err);
-    return res.status(500).send();
+  /*
+  if (!isValidFlowToken(decryptedBody.flow_token)) {
+    const error_response = {
+      error_msg: `The message is no longer available`,
+    };
+    return res
+      .status(427)
+      .send(
+        encryptResponse(error_response, aesKeyBuffer, initialVectorBuffer)
+      );
   }
+  */
 
-  console.log("👉 Response to Encrypt:", JSON.stringify(screenResponse, null, 2));
+  const screenResponse = await getNextScreen(decryptedBody);
+  console.log("👉 Response to Encrypt:", screenResponse);
 
-  const encryptedResponse = encryptResponse(
-    screenResponse,
-    aesKeyBuffer,
-    initialVectorBuffer
-  );
-
-  res.send(encryptedResponse);
+  res.send(encryptResponse(screenResponse, aesKeyBuffer, initialVectorBuffer));
 });
 
 app.get("/", (req, res) => {
-  res.send(`<pre>WhatsApp Flow endpoint is running.
+  res.send(`<pre>Nothing to see here.
 Checkout README.md to start.</pre>`);
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Server is listening on port: ${PORT}`);
-  console.log(`📍 Webhook endpoint: http://localhost:${PORT}/`);
-  console.log(`🔐 APP_SECRET: ${APP_SECRET ? 'Set ✅' : 'Not set ⚠️'}`);
+  console.log(`Server is listening on port: ${PORT}`);
 });
 
-/**
- * Validate the x-hub-signature-256 header from Meta using APP_SECRET.
- */
 function isRequestSignatureValid(req) {
-  if (!APP_SECRET) {
-    console.warn(
-      "⚠️ APP_SECRET is not set. Skipping request signature validation."
-    );
+  if(!APP_SECRET) {
+    console.warn("App Secret is not set up. Please Add your app secret in /.env file to check for request validation");
     return true;
   }
 
   const signatureHeader = req.get("x-hub-signature-256");
-  if (!signatureHeader || !signatureHeader.startsWith("sha256=")) {
-    console.error("❌ Missing or malformed x-hub-signature-256 header");
-    return false;
-  }
-
-  const signatureBuffer = Buffer.from(
-    signatureHeader.replace("sha256=", ""),
-    "hex"
-  );
+  const signatureBuffer = Buffer.from(signatureHeader.replace("sha256=", ""), "utf-8");
 
   const hmac = crypto.createHmac("sha256", APP_SECRET);
-  const digestString = hmac.update(req.rawBody || "").digest("hex");
-  const digestBuffer = Buffer.from(digestString, "hex");
+  const digestString = hmac.update(req.rawBody).digest('hex');
+  const digestBuffer = Buffer.from(digestString, "utf-8");
 
-  if (
-    signatureBuffer.length !== digestBuffer.length ||
-    !crypto.timingSafeEqual(digestBuffer, signatureBuffer)
-  ) {
-    console.error("❌ HMAC signature mismatch");
+  if ( !crypto.timingSafeEqual(digestBuffer, signatureBuffer)) {
+    console.error("Error: Request Signature did not match");
     return false;
   }
-
   return true;
 }
